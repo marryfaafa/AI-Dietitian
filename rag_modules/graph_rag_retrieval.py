@@ -152,10 +152,16 @@ class GraphRAGRetrieval:
           - Ingredient：食材节点，包含 name、category（如"蔬菜"、"蛋白质" 等）
           - Category：菜品分类（如"川菜"、"家常菜"、"素菜"）
           - CookingStep：烹饪步骤
+          - Constitution：体质节点（如"气虚质"、"痰湿质"），包含 name、description
+          - HealthCondition：病症节点（如"糖尿病"、"高血压"），包含 name、description
+          - DietaryRestriction：忌口节点（如"海鲜过敏"、"素食"），包含 name、description
         - 主要关系：
           - (Recipe)-[:REQUIRES]->(Ingredient)
           - (Recipe)-[:BELONGS_TO_CATEGORY]->(Category)
           - (Recipe)-[:CONTAINS_STEP]->(CookingStep)
+          - (Constitution/HealthCondition/DietaryRestriction)-[:FORBIDS]->(Ingredient)
+          - (Constitution/HealthCondition/DietaryRestriction)-[:LIMITS]->(Ingredient)
+          - (Constitution/HealthCondition/DietaryRestriction)-[:RECOMMENDS]->(Ingredient)
         
         请根据上述图结构分析下面的查询：
         

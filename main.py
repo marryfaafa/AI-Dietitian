@@ -131,17 +131,22 @@ class AdvancedGraphRAGSystem:
             logger.error(f"系统初始化失败: {e}")
             raise
     
-    def build_knowledge_base(self):
-        """构建知识库（如果需要）"""
+    def build_knowledge_base(self, use_parent_child: bool = True):
+        """
+        构建知识库（如果需要）
+
+        Args:
+            use_parent_child: 是否使用父子分块策略（默认True）
+        """
         print("\n检查知识库状态...")
-        
+
         try:
             # 检查Milvus集合是否存在
             if self.index_module.has_collection():
                 print("✅ 发现已存在的知识库，尝试加载...")
                 if self.index_module.load_collection():
                     print("知识库加载成功！")
-                    
+
                     # 重要：即使从已存在的知识库加载，也需要加载图数据以支持图索引
                     print("加载图数据以支持图检索...")
                     self.data_module.load_graph_data()
@@ -152,42 +157,62 @@ class AdvancedGraphRAGSystem:
                         chunk_size=self.config.chunk_size,
                         chunk_overlap=self.config.chunk_overlap
                     )
-                    
+
                     self._initialize_retrievers(chunks)
                     return
                 else:
                     print("❌ 知识库加载失败，开始重建...")
-            
+
             print("未找到已存在的集合，开始构建新的知识库...")
-            
+
             # 从Neo4j加载图数据
             print("从Neo4j加载图数据...")
             self.data_module.load_graph_data()
-            
+
             # 构建菜谱文档
             print("构建菜谱文档...")
             self.data_module.build_recipe_documents()
-            
-            # 进行文档分块
-            print("进行文档分块...")
-            chunks = self.data_module.chunk_documents(
-                chunk_size=self.config.chunk_size,
-                chunk_overlap=self.config.chunk_overlap
-            )
-            
-            # 构建Milvus向量索引
-            print("构建Milvus向量索引...")
-            if not self.index_module.build_vector_index(chunks):
-                raise Exception("构建向量索引失败")
-            
+
+            if use_parent_child:
+                # 使用父子分块策略
+                print("进行父子分块...")
+                pc_chunks = self.data_module.chunk_documents_with_parent_child(
+                    child_size=200,
+                    child_overlap=30,
+                    parent_size=800
+                )
+                parent_chunks = pc_chunks["parents"]
+                child_chunks = pc_chunks["children"]
+                print(f"   Parent块: {len(parent_chunks)}, Child块: {len(child_chunks)}")
+
+                # 构建父子分块向量索引
+                print("构建Milvus父子分块向量索引...")
+                if not self.index_module.build_parent_child_vector_index(parent_chunks, child_chunks):
+                    raise Exception("构建父子分块向量索引失败")
+
+                # 保存chunks供检索器使用
+                chunks = child_chunks
+            else:
+                # 使用传统分块策略
+                print("进行文档分块...")
+                chunks = self.data_module.chunk_documents(
+                    chunk_size=self.config.chunk_size,
+                    chunk_overlap=self.config.chunk_overlap
+                )
+
+                # 构建Milvus向量索引
+                print("构建Milvus向量索引...")
+                if not self.index_module.build_vector_index(chunks):
+                    raise Exception("构建向量索引失败")
+
             # 初始化检索器
             self._initialize_retrievers(chunks)
-            
+
             # 显示统计信息
             self._show_knowledge_base_stats()
-            
+
             print("✅ 知识库构建完成！")
-            
+
         except Exception as e:
             logger.error(f"知识库构建失败: {e}")
             raise

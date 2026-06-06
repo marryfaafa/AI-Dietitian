@@ -313,26 +313,26 @@ class GraphDataPreparationModule:
     
     def chunk_documents(self, chunk_size: int = 500, chunk_overlap: int = 50) -> List[Document]:
         """
-        对文档进行分块处理
-        
+        对文档进行分块处理（简单分块，向后兼容）
+
         Args:
             chunk_size: 分块大小
             chunk_overlap: 重叠大小
-            
+
         Returns:
             分块后的文档列表
         """
         logger.info(f"正在进行文档分块，块大小: {chunk_size}, 重叠: {chunk_overlap}")
-        
+
         if not self.documents:
             raise ValueError("请先构建文档")
-        
+
         chunks = []
         chunk_id = 0
-        
+
         for doc in self.documents:
             content = doc.page_content
-            
+
             # 简单的按长度分块
             if len(content) <= chunk_size:
                 # 内容较短，不需要分块
@@ -356,13 +356,13 @@ class GraphDataPreparationModule:
                 if len(sections) <= 1:
                     # 没有二级标题，按长度强制分块
                     total_chunks = (len(content) - 1) // (chunk_size - chunk_overlap) + 1
-                    
+
                     for i in range(total_chunks):
                         start = i * (chunk_size - chunk_overlap)
                         end = min(start + chunk_size, len(content))
-                        
+
                         chunk_content = content[start:end]
-                        
+
                         chunk = Document(
                             page_content=chunk_content,
                             metadata={
@@ -387,7 +387,7 @@ class GraphDataPreparationModule:
                         else:
                             # 其他部分添加章节标题
                             chunk_content = f"## {section}"
-                        
+
                         chunk = Document(
                             page_content=chunk_content,
                             metadata={
@@ -403,10 +403,221 @@ class GraphDataPreparationModule:
                         )
                         chunks.append(chunk)
                         chunk_id += 1
-        
+
         self.chunks = chunks
         logger.info(f"文档分块完成，共生成 {len(chunks)} 个块")
         return chunks
+
+    def chunk_documents_with_parent_child(
+        self,
+        child_size: int = 200,
+        child_overlap: int = 30,
+        parent_size: int = 800
+    ) -> Dict[str, List[Document]]:
+        """
+        父子分块策略：
+        - Parent Chunk: 大块，保留完整上下文，用于返回给LLM
+        - Child Chunk: 小块，用于向量检索，命中后返回对应Parent
+
+        Args:
+            child_size: 子块大小（用于检索）
+            child_overlap: 子块重叠大小
+            parent_size: 父块大小（用于上下文，按章节切分）
+
+        Returns:
+            {"parents": [...], "children": [...]}
+        """
+        logger.info(f"正在进行父子分块: child_size={child_size}, parent_size={parent_size}")
+
+        if not self.documents:
+            raise ValueError("请先构建文档")
+
+        parents = []
+        children = []
+
+        for doc in self.documents:
+            content = doc.page_content
+            recipe_id = doc.metadata["node_id"]
+
+            # ===== 1. 生成 Parent Chunks =====
+            # 按章节切分大块作为Parent
+            parent_chunks = self._split_into_parents(content, recipe_id, parent_size)
+
+            # 如果整个文档较短，直接作为一个Parent
+            if len(content) <= parent_size:
+                parent_chunks = [Document(
+                    page_content=content,
+                    metadata={
+                        **doc.metadata,
+                        "chunk_id": f"{recipe_id}_parent_0",
+                        "chunk_type": "parent",
+                        "chunk_index": 0,
+                        "total_chunks": 1,
+                        "chunk_size": len(content)
+                    }
+                )]
+
+            parents.extend(parent_chunks)
+
+            # ===== 2. 生成 Child Chunks =====
+            # 对每个Parent切分为更小的Child
+            for parent_idx, parent_doc in enumerate(parent_chunks):
+                parent_id = parent_doc.metadata["chunk_id"]
+                parent_content = parent_doc.page_content
+
+                # 按句子或段落切分Child
+                child_texts = self._split_into_children(parent_content, child_size, child_overlap)
+
+                for child_idx, child_text in enumerate(child_texts):
+                    child_doc = Document(
+                        page_content=child_text,
+                        metadata={
+                            **doc.metadata,
+                            "chunk_id": f"{recipe_id}_child_{parent_idx}_{child_idx}",
+                            "chunk_type": "child",
+                            "parent_chunk_id": parent_id,  # 指向Parent
+                            "parent_index": parent_idx,
+                            "child_index": child_idx,
+                            "chunk_size": len(child_text)
+                        }
+                    )
+                    children.append(child_doc)
+
+        logger.info(f"父子分块完成: {len(parents)} 个Parent块, {len(children)} 个Child块")
+
+        return {
+            "parents": parents,
+            "children": children
+        }
+
+    def _split_into_parents(self, content: str, recipe_id: str, parent_size: int) -> List[Document]:
+        """
+        将文档切分为Parent块（按章节或段落）
+        """
+        parents = []
+
+        # 优先按 ## 标题分章节
+        sections = content.split('\n## ')
+
+        if len(sections) <= 1:
+            # 无二级标题，按长度切分
+            if len(content) <= parent_size:
+                return [Document(
+                    page_content=content,
+                    metadata={
+                        "chunk_id": f"{recipe_id}_parent_0",
+                        "chunk_type": "parent",
+                        "chunk_index": 0,
+                        "total_chunks": 1,
+                        "chunk_size": len(content)
+                    }
+                )]
+
+            # 按段落切分
+            paragraphs = content.split('\n\n')
+            current_text = ""
+            parent_idx = 0
+
+            for para in paragraphs:
+                if len(current_text) + len(para) > parent_size and current_text:
+                    parents.append(Document(
+                        page_content=current_text.strip(),
+                        metadata={
+                            "chunk_id": f"{recipe_id}_parent_{parent_idx}",
+                            "chunk_type": "parent",
+                            "chunk_index": parent_idx,
+                            "chunk_size": len(current_text.strip())
+                        }
+                    ))
+                    parent_idx += 1
+                    current_text = para
+                else:
+                    current_text += "\n\n" + para if current_text else para
+
+            if current_text.strip():
+                parents.append(Document(
+                    page_content=current_text.strip(),
+                    metadata={
+                        "chunk_id": f"{recipe_id}_parent_{parent_idx}",
+                        "chunk_type": "parent",
+                        "chunk_index": parent_idx,
+                        "chunk_size": len(current_text.strip())
+                    }
+                ))
+
+            # 更新total_chunks
+            for doc in parents:
+                doc.metadata["total_chunks"] = len(parents)
+
+        else:
+            # 有二级标题，每个章节作为一个Parent
+            for i, section in enumerate(sections):
+                if i == 0:
+                    chunk_content = section
+                else:
+                    chunk_content = f"## {section}"
+
+                parents.append(Document(
+                    page_content=chunk_content,
+                    metadata={
+                        "chunk_id": f"{recipe_id}_parent_{i}",
+                        "chunk_type": "parent",
+                        "chunk_index": i,
+                        "total_chunks": len(sections),
+                        "chunk_size": len(chunk_content),
+                        "section_title": section.split('\n')[0].strip() if i > 0 else "主标题"
+                    }
+                ))
+
+        return parents
+
+    def _split_into_children(self, text: str, child_size: int, overlap: int) -> List[str]:
+        """
+        将Parent文本切分为小的Child块
+        优先按句子/段落切分，保持语义完整性
+        """
+        if len(text) <= child_size:
+            return [text]
+
+        children = []
+
+        # 先按换行切分为行
+        lines = text.split('\n')
+        current_chunk = ""
+
+        for line in lines:
+            # 如果当前行本身很长，需要进一步切分
+            if len(line) > child_size:
+                # 先保存当前chunk
+                if current_chunk.strip():
+                    children.append(current_chunk.strip())
+                    current_chunk = ""
+
+                # 按长度切分长行
+                for i in range(0, len(line), child_size - overlap):
+                    chunk = line[i:i + child_size]
+                    if chunk.strip():
+                        children.append(chunk.strip())
+                continue
+
+            # 尝试合并行
+            if len(current_chunk) + len(line) + 1 > child_size:
+                if current_chunk.strip():
+                    children.append(current_chunk.strip())
+                # 保留重叠部分
+                if overlap > 0 and current_chunk:
+                    words = current_chunk.split()
+                    overlap_text = " ".join(words[-3:]) if len(words) > 3 else ""
+                    current_chunk = overlap_text + "\n" + line
+                else:
+                    current_chunk = line
+            else:
+                current_chunk += "\n" + line if current_chunk else line
+
+        if current_chunk.strip():
+            children.append(current_chunk.strip())
+
+        return children if children else [text[:child_size]]
     
 
     

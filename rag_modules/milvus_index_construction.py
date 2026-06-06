@@ -88,14 +88,17 @@ class MilvusIndexConstructionModule:
         
         logger.info("嵌入模型初始化完成")
     
-    def _create_collection_schema(self) -> CollectionSchema:
+    def _create_collection_schema(self, support_parent_child: bool = False) -> CollectionSchema:
         """
         创建集合模式
-        
+
+        Args:
+            support_parent_child: 是否支持父子分块
+
         Returns:
             集合模式对象
         """
-        # 定义字段
+        # 定义基础字段
         fields = [
             FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=150, is_primary=True),
             FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=self.dimension),
@@ -110,13 +113,20 @@ class MilvusIndexConstructionModule:
             FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=150),
             FieldSchema(name="parent_id", dtype=DataType.VARCHAR, max_length=100)
         ]
-        
+
+        # 添加父子分块支持字段
+        if support_parent_child:
+            fields.extend([
+                FieldSchema(name="chunk_type", dtype=DataType.VARCHAR, max_length=20),  # parent or child
+                FieldSchema(name="parent_chunk_id", dtype=DataType.VARCHAR, max_length=150)  # 指向父块ID
+            ])
+
         # 创建集合模式
         schema = CollectionSchema(
             fields=fields,
             description="中式烹饪知识图谱向量集合"
         )
-        
+
         return schema
     
     def create_collection(self, force_recreate: bool = False) -> bool:
@@ -199,28 +209,28 @@ class MilvusIndexConstructionModule:
     def build_vector_index(self, chunks: List[Document]) -> bool:
         """
         构建向量索引
-        
+
         Args:
             chunks: 文档块列表
-            
+
         Returns:
             是否构建成功
         """
         logger.info(f"正在构建Milvus向量索引，文档数量: {len(chunks)}...")
-        
+
         if not chunks:
             raise ValueError("文档块列表不能为空")
-        
+
         try:
             # 1. 创建集合（如果schema不兼容则强制重新创建）
             if not self.create_collection(force_recreate=True):
                 return False
-            
+
             # 2. 准备数据
             logger.info("正在生成向量embeddings...")
             texts = [chunk.page_content for chunk in chunks]
             vectors = self.embeddings.embed_documents(texts)
-            
+
             # 3. 准备插入数据
             entities = []
             for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
@@ -239,7 +249,7 @@ class MilvusIndexConstructionModule:
                     "parent_id": self._safe_truncate(chunk.metadata.get("parent_id", ""), 100)
                 }
                 entities.append(entity)
-            
+
             # 4. 批量插入数据
             logger.info("正在插入向量数据...")
             batch_size = 100
@@ -250,24 +260,134 @@ class MilvusIndexConstructionModule:
                     data=batch
                 )
                 logger.info(f"已插入 {min(i + batch_size, len(entities))}/{len(entities)} 条数据")
-            
+
             # 5. 创建索引
             if not self.create_index():
                 return False
-            
+
             # 6. 加载集合到内存
             self.client.load_collection(self.collection_name)
             logger.info("集合已加载到内存")
-            
+
             # 7. 等待索引构建完成
             logger.info("等待索引构建完成...")
             time.sleep(2)
-            
+
             logger.info(f"向量索引构建完成，包含 {len(chunks)} 个向量")
             return True
-            
+
         except Exception as e:
             logger.error(f"构建向量索引失败: {e}")
+            return False
+
+    def build_parent_child_vector_index(self, parent_chunks: List[Document], child_chunks: List[Document]) -> bool:
+        """
+        构建父子分块向量索引
+
+        - 只对 child_chunks 建立向量索引（用于检索）
+        - parent_chunks 存储为文本（用于返回上下文）
+
+        Args:
+            parent_chunks: 父块列表（大块，完整上下文）
+            child_chunks: 子块列表（小块，用于检索）
+
+        Returns:
+            是否构建成功
+        """
+        logger.info(f"正在构建父子分块向量索引: {len(parent_chunks)} 个Parent, {len(child_chunks)} 个Child...")
+
+        if not child_chunks:
+            raise ValueError("子块列表不能为空")
+
+        try:
+            # 1. 创建集合（支持父子分块字段）
+            if self.client.has_collection(self.collection_name):
+                self.client.drop_collection(self.collection_name)
+
+            schema = self._create_collection_schema(support_parent_child=True)
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                schema=schema,
+                metric_type="COSINE",
+                consistency_level="Strong"
+            )
+            self.collection_created = True
+            logger.info("父子分块集合创建成功")
+
+            # 2. 先插入 Parent Chunks（不生成向量，仅存储文本）
+            logger.info("正在插入 Parent Chunks...")
+            parent_entities = []
+            for i, chunk in enumerate(parent_chunks):
+                entity = {
+                    "id": self._safe_truncate(chunk.metadata.get("chunk_id", f"parent_{i}"), 150),
+                    "vector": [0.0] * self.dimension,  # 占位向量
+                    "text": self._safe_truncate(chunk.page_content, 15000),
+                    "node_id": self._safe_truncate(chunk.metadata.get("node_id", ""), 100),
+                    "recipe_name": self._safe_truncate(chunk.metadata.get("recipe_name", ""), 300),
+                    "node_type": self._safe_truncate(chunk.metadata.get("node_type", ""), 100),
+                    "category": self._safe_truncate(chunk.metadata.get("category", ""), 100),
+                    "cuisine_type": self._safe_truncate(chunk.metadata.get("cuisine_type", ""), 200),
+                    "difficulty": int(chunk.metadata.get("difficulty", 0)),
+                    "doc_type": "parent",
+                    "chunk_id": self._safe_truncate(chunk.metadata.get("chunk_id", f"parent_{i}"), 150),
+                    "parent_id": self._safe_truncate(chunk.metadata.get("node_id", ""), 100),
+                    "chunk_type": "parent",
+                    "parent_chunk_id": ""
+                }
+                parent_entities.append(entity)
+
+            # 批量插入Parent
+            batch_size = 100
+            for i in range(0, len(parent_entities), batch_size):
+                batch = parent_entities[i:i + batch_size]
+                self.client.insert(collection_name=self.collection_name, data=batch)
+            logger.info(f"已插入 {len(parent_entities)} 个 Parent Chunks")
+
+            # 3. 插入 Child Chunks（生成向量，用于检索）
+            logger.info("正在生成 Child Chunks 向量...")
+            child_texts = [chunk.page_content for chunk in child_chunks]
+            child_vectors = self.embeddings.embed_documents(child_texts)
+
+            child_entities = []
+            for i, (chunk, vector) in enumerate(zip(child_chunks, child_vectors)):
+                entity = {
+                    "id": self._safe_truncate(chunk.metadata.get("chunk_id", f"child_{i}"), 150),
+                    "vector": vector,
+                    "text": self._safe_truncate(chunk.page_content, 15000),
+                    "node_id": self._safe_truncate(chunk.metadata.get("node_id", ""), 100),
+                    "recipe_name": self._safe_truncate(chunk.metadata.get("recipe_name", ""), 300),
+                    "node_type": self._safe_truncate(chunk.metadata.get("node_type", ""), 100),
+                    "category": self._safe_truncate(chunk.metadata.get("category", ""), 100),
+                    "cuisine_type": self._safe_truncate(chunk.metadata.get("cuisine_type", ""), 200),
+                    "difficulty": int(chunk.metadata.get("difficulty", 0)),
+                    "doc_type": "child",
+                    "chunk_id": self._safe_truncate(chunk.metadata.get("chunk_id", f"child_{i}"), 150),
+                    "parent_id": self._safe_truncate(chunk.metadata.get("parent_id", ""), 100),
+                    "chunk_type": "child",
+                    "parent_chunk_id": self._safe_truncate(chunk.metadata.get("parent_chunk_id", ""), 150)
+                }
+                child_entities.append(entity)
+
+            # 批量插入Child
+            for i in range(0, len(child_entities), batch_size):
+                batch = child_entities[i:i + batch_size]
+                self.client.insert(collection_name=self.collection_name, data=batch)
+                logger.info(f"已插入 {min(i + batch_size, len(child_entities))}/{len(child_entities)} 个 Child Chunks")
+
+            # 4. 创建索引
+            if not self.create_index():
+                return False
+
+            # 5. 加载集合到内存
+            self.client.load_collection(self.collection_name)
+            logger.info("集合已加载到内存")
+
+            time.sleep(2)
+            logger.info(f"父子分块向量索引构建完成: {len(parent_entities)} Parent + {len(child_entities)} Child")
+            return True
+
+        except Exception as e:
+            logger.error(f"构建父子分块向量索引失败: {e}")
             return False
     
     def add_documents(self, new_chunks: List[Document]) -> bool:
@@ -325,22 +445,22 @@ class MilvusIndexConstructionModule:
     def similarity_search(self, query: str, k: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         相似度搜索
-        
+
         Args:
             query: 查询文本
             k: 返回结果数量
             filters: 过滤条件
-            
+
         Returns:
             搜索结果列表
         """
         if not self.collection_created:
             raise ValueError("请先构建或加载向量索引")
-        
+
         try:
             # 生成查询向量
             query_vector = self.embeddings.embed_query(query)
-            
+
             # 构建过滤表达式
             filter_expr = ""
             if filters:
@@ -358,34 +478,34 @@ class MilvusIndexConstructionModule:
                         else:
                             value_str = ', '.join(map(str, value))
                             filter_conditions.append(f'{key} in [{value_str}]')
-                
+
                 if filter_conditions:
                     filter_expr = " and ".join(filter_conditions)
-            
+
             # 执行搜索 - 修复参数传递
             search_params = {
                 "metric_type": "COSINE",
                 "params": {"ef": 64}
             }
-            
+
             # 构建搜索参数，避免重复传递
             search_kwargs = {
                 "collection_name": self.collection_name,
                 "data": [query_vector],
                 "anns_field": "vector",
                 "limit": k,
-                "output_fields": ["text", "node_id", "recipe_name", "node_type", 
+                "output_fields": ["text", "node_id", "recipe_name", "node_type",
                                 "category", "cuisine_type", "difficulty", "doc_type",
                                 "chunk_id", "parent_id"],
                 "search_params": search_params
             }
-            
+
             # 只在有过滤条件时添加filter参数
             if filter_expr:
                 search_kwargs["filter"] = filter_expr
-                
+
             results = self.client.search(**search_kwargs)
-            
+
             # 处理结果
             formatted_results = []
             if results and len(results) > 0:
@@ -407,11 +527,129 @@ class MilvusIndexConstructionModule:
                         }
                     }
                     formatted_results.append(result)
-            
+
             return formatted_results
-            
+
         except Exception as e:
             logger.error(f"相似度搜索失败: {e}")
+            return []
+
+    def search_with_parent_context(self, query: str, k: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        父子分块检索：检索Child块，返回对应的Parent块上下文
+
+        Args:
+            query: 查询文本
+            k: 返回结果数量
+            filters: 过滤条件
+
+        Returns:
+            搜索结果列表（包含Parent上下文）
+        """
+        if not self.collection_created:
+            raise ValueError("请先构建或加载向量索引")
+
+        try:
+            # 1. 检索Child块
+            query_vector = self.embeddings.embed_query(query)
+
+            search_params = {
+                "metric_type": "COSINE",
+                "params": {"ef": 64}
+            }
+
+            # 只检索child类型的块
+            filter_expr = 'chunk_type == "child"'
+            if filters:
+                for key, value in filters.items():
+                    if isinstance(value, str):
+                        filter_expr += f' and {key} == "{value}"'
+                    elif isinstance(value, (int, float)):
+                        filter_expr += f' and {key} == {value}'
+
+            search_kwargs = {
+                "collection_name": self.collection_name,
+                "data": [query_vector],
+                "anns_field": "vector",
+                "limit": k,
+                "output_fields": ["text", "node_id", "recipe_name", "node_type",
+                                "category", "cuisine_type", "difficulty", "doc_type",
+                                "chunk_id", "parent_id", "chunk_type", "parent_chunk_id"],
+                "search_params": search_params,
+                "filter": filter_expr
+            }
+
+            results = self.client.search(**search_kwargs)
+
+            if not results or len(results) == 0:
+                return []
+
+            # 2. 收集命中的Parent Chunk ID
+            child_hits = []
+            parent_chunk_ids = set()
+
+            for hit in results[0]:
+                child_hits.append(hit)
+                parent_id = hit["entity"].get("parent_chunk_id", "")
+                if parent_id:
+                    parent_chunk_ids.add(parent_id)
+
+            # 3. 批量查询Parent块
+            parent_chunks_map = {}
+            if parent_chunk_ids:
+                parent_ids_list = list(parent_chunk_ids)
+                parent_results = self.client.query(
+                    collection_name=self.collection_name,
+                    filter=f'chunk_type == "parent" and id in {parent_ids_list}',
+                    output_fields=["id", "text", "node_id", "recipe_name", "category", "cuisine_type"]
+                )
+                for parent in parent_results:
+                    parent_chunks_map[parent["id"]] = parent
+
+            # 4. 组装结果：返回Parent上下文 + 命中的Child信息
+            formatted_results = []
+            seen_parents = set()
+
+            for hit in child_hits:
+                parent_chunk_id = hit["entity"].get("parent_chunk_id", "")
+
+                # 如果有对应的Parent块，返回Parent上下文
+                if parent_chunk_id and parent_chunk_id in parent_chunks_map and parent_chunk_id not in seen_parents:
+                    parent = parent_chunks_map[parent_chunk_id]
+                    result = {
+                        "id": parent["id"],
+                        "score": hit["distance"],
+                        "text": parent["text"],  # 返回Parent的完整文本
+                        "matched_child": hit["entity"]["text"],  # 命中的Child文本
+                        "metadata": {
+                            "node_id": parent.get("node_id", ""),
+                            "recipe_name": parent.get("recipe_name", ""),
+                            "category": parent.get("category", ""),
+                            "cuisine_type": parent.get("cuisine_type", ""),
+                            "chunk_type": "parent",
+                            "matched_child_id": hit["entity"].get("chunk_id", "")
+                        }
+                    }
+                    formatted_results.append(result)
+                    seen_parents.add(parent_chunk_id)
+                elif not parent_chunk_id:
+                    # 没有Parent，直接返回Child结果
+                    result = {
+                        "id": hit["id"],
+                        "score": hit["distance"],
+                        "text": hit["entity"]["text"],
+                        "metadata": {
+                            "node_id": hit["entity"].get("node_id", ""),
+                            "recipe_name": hit["entity"].get("recipe_name", ""),
+                            "chunk_type": "child"
+                        }
+                    }
+                    formatted_results.append(result)
+
+            return formatted_results
+
+        except Exception as e:
+            logger.error(f"父子分块检索失败: {e}")
             return []
     
     def get_collection_stats(self) -> Dict[str, Any]:

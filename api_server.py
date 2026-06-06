@@ -21,7 +21,24 @@ from rag_modules.session_manager import SessionManager
 from rag_modules.meal_planner import MealPlanner
 from config import DEFAULT_CONFIG
 
-compliance = DietaryComplianceModule(DEFAULT_CONFIG.dietary_knowledge_path)
+# Neo4j 图数据库连接（懒加载）
+_neo4j_driver = None
+
+def get_neo4j():
+    global _neo4j_driver
+    if _neo4j_driver is None:
+        from neo4j import GraphDatabase
+        _neo4j_driver = GraphDatabase.driver(
+            DEFAULT_CONFIG.neo4j_uri,
+            auth=(DEFAULT_CONFIG.neo4j_user, DEFAULT_CONFIG.neo4j_password)
+        )
+    return _neo4j_driver
+
+# 合规模块：优先从 Neo4j 加载，降级到 JSON
+compliance = DietaryComplianceModule(
+    knowledge_path=DEFAULT_CONFIG.dietary_knowledge_path,
+    neo4j_driver_factory=get_neo4j
+)
 profile_mgr = UserProfileManager(DEFAULT_CONFIG.sqlite_db_path)
 session_mgr = SessionManager(host=DEFAULT_CONFIG.redis_host, port=DEFAULT_CONFIG.redis_port, ttl=DEFAULT_CONFIG.session_ttl)
 
@@ -308,19 +325,6 @@ def delete_session(session_id):
 
 # ============ LLM Chat (RAG + Redis cache) ============
 import hashlib
-
-# Neo4j 图数据库连接（懒加载）
-_neo4j_driver = None
-
-def get_neo4j():
-    global _neo4j_driver
-    if _neo4j_driver is None:
-        from neo4j import GraphDatabase
-        _neo4j_driver = GraphDatabase.driver(
-            DEFAULT_CONFIG.neo4j_uri,
-            auth=(DEFAULT_CONFIG.neo4j_user, DEFAULT_CONFIG.neo4j_password)
-        )
-    return _neo4j_driver
 
 
 def rag_retrieve(query: str, profile_data: dict, top_k: int = 8) -> str:

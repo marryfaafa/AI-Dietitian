@@ -1,11 +1,15 @@
 """
 饮食合规性检查模块 - Phase 2
 基于用户体质/病症/忌口进行食材合规性检查
+
+支持两种数据源:
+1. Neo4j 图数据库（优先）- 从 Constitution/HealthCondition/DietaryRestriction 节点加载
+2. JSON 文件（降级方案）- 从 dietary_knowledge.json 加载
 """
 
 import json
 import logging
-from typing import List, Dict, Set, Optional
+from typing import List, Dict, Set, Optional, Callable
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -25,21 +29,152 @@ class ComplianceResult:
 class DietaryComplianceModule:
     """饮食合规性检查模块"""
 
-    def __init__(self, knowledge_path: str):
+    def __init__(self, knowledge_path: str = None, neo4j_driver=None,
+                 neo4j_driver_factory: Callable = None):
         """
         初始化合规模块
+
         Args:
-            knowledge_path: dietary_knowledge.json 文件路径
+            knowledge_path: dietary_knowledge.json 文件路径（降级方案）
+            neo4j_driver: Neo4j driver 实例
+            neo4j_driver_factory: 返回 Neo4j driver 的工厂函数（懒加载用）
         """
-        self.knowledge = self._load_knowledge(knowledge_path)
+        self._driver = neo4j_driver
+        self._driver_factory = neo4j_driver_factory
+        self._knowledge_path = knowledge_path
 
         # 快速查询索引
         self._forbidden_map: Dict[str, Set[str]] = {}  # {条件名: {禁忌食材}}
         self._recommended_map: Dict[str, Set[str]] = {}  # {条件名: {推荐食材}}
         self._limited_map: Dict[str, Set[str]] = {}  # {条件名: {限制食材}}
-        self._build_index()
 
-        logger.info(f"饮食合规模块初始化完成，已加载 {len(self.knowledge)} 条健康知识")
+        # 选项列表（供前端使用）
+        self._constitutions: List[Dict] = []
+        self._conditions: List[Dict] = []
+        self._restrictions: List[Dict] = []
+
+        self._initialized = False
+
+    def _ensure_initialized(self):
+        """懒加载 - 首次使用时初始化"""
+        if self._initialized:
+            return
+        self._initialized = True
+
+        # 优先使用 Neo4j
+        driver = self._get_driver()
+        if driver:
+            try:
+                self._build_index_from_neo4j(driver)
+                logger.info("饮食合规模块初始化完成（数据源: Neo4j）")
+                return
+            except Exception as e:
+                logger.warning(f"从 Neo4j 加载健康数据失败: {e}，尝试 JSON 降级")
+
+        # 降级到 JSON
+        if self._knowledge_path:
+            self._build_index_from_json()
+            logger.info("饮食合规模块初始化完成（数据源: JSON）")
+        else:
+            logger.warning("无可用数据源，饮食合规模块将使用空知识库")
+
+    def _get_driver(self):
+        """获取 Neo4j driver"""
+        if self._driver:
+            return self._driver
+        if self._driver_factory:
+            try:
+                self._driver = self._driver_factory()
+                return self._driver
+            except Exception as e:
+                logger.warning(f"通过工厂函数获取 Neo4j driver 失败: {e}")
+        return None
+
+    def _build_index_from_neo4j(self, driver):
+        """从 Neo4j 图数据库构建索引"""
+        with driver.session() as session:
+            # 加载体质
+            result = session.run("""
+                MATCH (c:Constitution)
+                OPTIONAL MATCH (c)-[:RECOMMENDS]->(r:Ingredient)
+                OPTIONAL MATCH (c)-[:FORBIDS]->(f:Ingredient)
+                RETURN c.name AS name, c.description AS description,
+                       collect(DISTINCT r.name) AS recommended,
+                       collect(DISTINCT f.name) AS forbidden
+            """)
+            for record in result:
+                name = record["name"]
+                self._constitutions.append({"name": name, "description": record["description"]})
+                self._recommended_map[name] = set(record["recommended"]) - {""}
+                self._forbidden_map[name] = set(record["forbidden"]) - {""}
+
+            # 加载病症
+            result = session.run("""
+                MATCH (h:HealthCondition)
+                OPTIONAL MATCH (h)-[:FORBIDS]->(f:Ingredient)
+                OPTIONAL MATCH (h)-[:LIMITS]->(l:Ingredient)
+                OPTIONAL MATCH (h)-[:RECOMMENDS]->(r:Ingredient)
+                RETURN h.name AS name, h.description AS description,
+                       collect(DISTINCT f.name) AS forbidden,
+                       collect(DISTINCT l.name) AS limited,
+                       collect(DISTINCT r.name) AS recommended
+            """)
+            for record in result:
+                name = record["name"]
+                self._conditions.append({"name": name, "description": record["description"]})
+                self._forbidden_map[name] = set(record["forbidden"]) - {""}
+                self._limited_map[name] = set(record["limited"]) - {""}
+                self._recommended_map[name] = set(record["recommended"]) - {""}
+
+            # 加载忌口
+            result = session.run("""
+                MATCH (d:DietaryRestriction)
+                OPTIONAL MATCH (d)-[:FORBIDS]->(f:Ingredient)
+                OPTIONAL MATCH (d)-[:LIMITS]->(l:Ingredient)
+                OPTIONAL MATCH (d)-[:RECOMMENDS]->(r:Ingredient)
+                RETURN d.name AS name, d.description AS description,
+                       collect(DISTINCT f.name) AS forbidden,
+                       collect(DISTINCT l.name) AS limited,
+                       collect(DISTINCT r.name) AS recommended
+            """)
+            for record in result:
+                name = record["name"]
+                self._restrictions.append({
+                    "name": name,
+                    "description": record["description"],
+                    "forbidden_count": len(set(record["forbidden"]) - {""})
+                })
+                self._forbidden_map[name] = set(record["forbidden"]) - {""}
+                if record["limited"]:
+                    self._limited_map[name] = set(record["limited"]) - {""}
+                if record["recommended"]:
+                    self._recommended_map[name] = set(record["recommended"]) - {""}
+
+    def _build_index_from_json(self):
+        """从 JSON 文件构建索引（降级方案）"""
+        knowledge = self._load_knowledge(self._knowledge_path)
+
+        for item in knowledge.get("body_constitutions", []):
+            name = item["name"]
+            self._constitutions.append({"name": name, "description": item.get("description", "")})
+            self._forbidden_map[name] = set(item.get("avoid", []))
+            self._recommended_map[name] = set(item.get("recommend", []))
+
+        for item in knowledge.get("health_conditions", []):
+            name = item["name"]
+            self._conditions.append({"name": name, "description": item.get("description", "")})
+            self._forbidden_map[name] = set(item.get("forbidden_ingredients", []))
+            self._limited_map[name] = set(item.get("limited_ingredients", []))
+            self._recommended_map[name] = set(item.get("recommended_ingredients", []))
+
+        for item in knowledge.get("dietary_restrictions", []):
+            name = item["name"]
+            self._restrictions.append({
+                "name": name,
+                "description": item.get("description", ""),
+                "forbidden_count": len(item.get("forbidden", []))
+            })
+            self._forbidden_map[name] = set(item.get("forbidden", []))
 
     def _load_knowledge(self, path: str) -> Dict:
         """加载健康知识库"""
@@ -53,31 +188,23 @@ class DietaryComplianceModule:
             logger.error(f"加载健康知识库失败: {e}")
             return {"body_constitutions": [], "health_conditions": [], "dietary_restrictions": [], "nutrients": []}
 
-    def _build_index(self):
-        """构建快速查询索引"""
-        # 体质
-        for item in self.knowledge.get("body_constitutions", []):
-            name = item["name"]
-            self._forbidden_map[name] = set(item.get("avoid", []))
-            self._recommended_map[name] = set(item.get("recommend", []))
-
-        # 病症
-        for item in self.knowledge.get("health_conditions", []):
-            name = item["name"]
-            self._forbidden_map[name] = set(item.get("forbidden_ingredients", []))
-            self._limited_map[name] = set(item.get("limited_ingredients", []))
-            self._recommended_map[name] = set(item.get("recommended_ingredients", []))
-
-        # 忌口/过敏
-        for item in self.knowledge.get("dietary_restrictions", []):
-            name = item["name"]
-            self._forbidden_map[name] = set(item.get("forbidden", []))
+    def refresh(self):
+        """强制重新加载数据"""
+        self._initialized = False
+        self._forbidden_map.clear()
+        self._recommended_map.clear()
+        self._limited_map.clear()
+        self._constitutions.clear()
+        self._conditions.clear()
+        self._restrictions.clear()
+        self._ensure_initialized()
 
     def get_forbidden_ingredients(self,
                                    constitutions: Optional[List[str]] = None,
                                    conditions: Optional[List[str]] = None,
                                    restrictions: Optional[List[str]] = None) -> Set[str]:
         """获取用户的所有禁忌食材"""
+        self._ensure_initialized()
         forbidden = set()
         all_labels = []
 
@@ -102,6 +229,7 @@ class DietaryComplianceModule:
                                      conditions: Optional[List[str]] = None,
                                      restrictions: Optional[List[str]] = None) -> Set[str]:
         """获取推荐食材"""
+        self._ensure_initialized()
         recommended = set()
         all_labels = []
 
@@ -134,6 +262,7 @@ class DietaryComplianceModule:
         Returns:
             ComplianceResult 合规检查结果
         """
+        self._ensure_initialized()
         reasons = []
         warnings = []
         suitable_ings = []
@@ -269,15 +398,15 @@ class DietaryComplianceModule:
 
     def get_constitution_list(self) -> List[Dict]:
         """获取支持的体质列表"""
-        return [{"name": c["name"], "description": c["description"]}
-                for c in self.knowledge.get("body_constitutions", [])]
+        self._ensure_initialized()
+        return self._constitutions
 
     def get_condition_list(self) -> List[Dict]:
         """获取支持的健康状况列表"""
-        return [{"name": c["name"], "description": c["description"]}
-                for c in self.knowledge.get("health_conditions", [])]
+        self._ensure_initialized()
+        return self._conditions
 
     def get_restriction_list(self) -> List[Dict]:
         """获取支持的饮食限制列表"""
-        return [{"name": r["name"], "forbidden_count": len(r.get("forbidden", []))}
-                for r in self.knowledge.get("dietary_restrictions", [])]
+        self._ensure_initialized()
+        return self._restrictions
